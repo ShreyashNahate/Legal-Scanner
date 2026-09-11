@@ -1,0 +1,32 @@
+# Python
+backend/venv/
+backend/__pycache__/
+backend/*.py[cod]
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python generated/cache
+backend/.paddlex/
+backend/ocr_text/
+backend/pdf_pages/
+backend/input_product/api_uploads/
+backend/input_pdf/api_uploads/
+
+# Flutter
+flutter_app/.dart_tool/
+flutter_app/build/
+flutter_app/.flutter-plugins
+flutter_app/.flutter-plugins-dependencies
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

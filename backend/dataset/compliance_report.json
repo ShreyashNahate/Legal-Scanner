@@ -1,0 +1,93 @@
+{
+  "product_name": "Sample Protein Bar",
+  "summary": {
+    "total_checks": 9,
+    "passed": 3,
+    "failed": 2,
+    "review": 4,
+    "not_applicable": 0
+  },
+  "results": [
+    {
+      "rule_number": 6,
+      "title": "Declarations to be made on every package",
+      "field": "mandatory_declarations",
+      "check_type": "review_only",
+      "status": "REVIEW",
+      "detected_value": "",
+      "evidence": "This check requires layout/placement information not available from text alone; requires manual verification"
+    },
+    {
+      "rule_number": 7,
+      "title": "Principal display panel — its area, size and letter etc.",
+      "field": "principal_display_panel",
+      "check_type": "review_only",
+      "status": "REVIEW",
+      "detected_value": "",
+      "evidence": "This check requires layout/placement information not available from text alone; requires manual verification"
+    },
+    {
+      "rule_number": 8,
+      "title": "Declaration where to appear",
+      "field": "declaration_placement",
+      "check_type": "review_only",
+      "status": "REVIEW",
+      "detected_value": "",
+      "evidence": "This check requires layout/placement information not available from text alone; requires manual verification"
+    },
+    {
+      "rule_number": 9,
+      "title": "Manner in which declaration shall be made",
+      "field": "declaration_manner",
+      "check_type": "review_only",
+      "status": "REVIEW",
+      "detected_value": "",
+      "evidence": "This check requires layout/placement information not available from text alone; requires manual verification"
+    },
+    {
+      "rule_number": 10,
+      "title": "Declaration of name and address of the manufacturer, etc.",
+      "field": "manufacturer_name",
+      "check_type": "presence",
+      "status": "PASS",
+      "detected_value": "ABC Foods Pvt Ltd",
+      "evidence": "Declaration detected"
+    },
+    {
+      "rule_number": 10,
+      "title": "Declaration of name and address of the manufacturer, etc.",
+      "field": "manufacturer_address",
+      "check_type": "presence",
+      "status": "FAIL",
+      "detected_value": "",
+      "evidence": "Declaration not detected"
+    },
+    {
+      "rule_number": 11,
+      "title": "General provisions relating to declaration of quantity",
+      "field": "net_quantity",
+      "check_type": "presence",
+      "status": "PASS",
+      "detected_value": "60 g",
+      "evidence": "Declaration detected"
+    },
+    {
+      "rule_number": 12,
+      "title": "Manner in which declaration of quantity shall be made",
+      "field": "quantity_format",
+      "check_type": "format",
+      "status": "FAIL",
+      "detected_value": "",
+      "evidence": "Declaration not detected"
+    },
+    {
+      "rule_number": 13,
+      "title": "Statement of units of weight, measure or number",
+      "field": "quantity_unit",
+      "check_type": "format",
+      "status": "PASS",
+      "detected_value": "g",
+      "evidence": "Declaration present and correctly formatted"
+    }
+  ]
+}

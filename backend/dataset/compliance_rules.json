@@ -1,0 +1,92 @@
+[
+  {
+    "rule_number": 6,
+    "field": "mandatory_declarations",
+    "check_type": "review_only",
+    "title": "Declarations to be made on every package",
+    "source_text": "Every package is required to bear the prescribed declarations. These include applicable declarations relating to the manufacturer/packer/importer, commodity, net quantity, retail sale price and consumer-related information, subject to the specific requirements and exemptions in the rules.",
+    "source_pages": [
+      1
+    ]
+  },
+  {
+    "rule_number": 7,
+    "field": "principal_display_panel",
+    "check_type": "review_only",
+    "title": "Principal display panel — its area, size and letter etc.",
+    "source_text": "This rule specifies requirements concerning the principal display panel, including its area, size and the manner in which prescribed declarations are displayed.",
+    "source_pages": [
+      1
+    ]
+  },
+  {
+    "rule_number": 8,
+    "field": "declaration_placement",
+    "check_type": "review_only",
+    "title": "Declaration where to appear",
+    "source_text": "This rule specifies where the required declarations are to appear on the package.",
+    "source_pages": [
+      1
+    ]
+  },
+  {
+    "rule_number": 9,
+    "field": "declaration_manner",
+    "check_type": "review_only",
+    "title": "Manner in which declaration shall be made",
+    "source_text": "This rule specifies the manner in which declarations must be made, including requirements concerning visibility, legibility and the prescribed presentation of declarations.",
+    "source_pages": [
+      1
+    ]
+  },
+  {
+    "rule_number": 10,
+    "field": "manufacturer_name",
+    "check_type": "presence",
+    "title": "Declaration of name and address of the manufacturer, etc.",
+    "source_text": "This rule specifies requirements for declaring the name and address of the manufacturer, packer and/or importer, as applicable.",
+    "source_pages": [
+      1
+    ]
+  },
+  {
+    "rule_number": 10,
+    "field": "manufacturer_address",
+    "check_type": "presence",
+    "title": "Declaration of name and address of the manufacturer, etc.",
+    "source_text": "This rule specifies requirements for declaring the name and address of the manufacturer, packer and/or importer, as applicable.",
+    "source_pages": [
+      1
+    ]
+  },
+  {
+    "rule_number": 11,
+    "field": "net_quantity",
+    "check_type": "presence",
+    "title": "General provisions relating to declaration of quantity",
+    "source_text": "This rule contains general requirements for declaring the quantity of the commodity in the package.",
+    "source_pages": [
+      2
+    ]
+  },
+  {
+    "rule_number": 12,
+    "field": "quantity_format",
+    "check_type": "format",
+    "title": "Manner in which declaration of quantity shall be made",
+    "source_text": "This rule specifies the manner and form in which the quantity declaration is to be made.",
+    "source_pages": [
+      2
+    ]
+  },
+  {
+    "rule_number": 13,
+    "field": "quantity_unit",
+    "check_type": "format",
+    "title": "Statement of units of weight, measure or number",
+    "source_text": "This rule specifies the units in which declarations of weight, measure or number are to be expressed.",
+    "source_pages": [
+      2
+    ]
+  }
+]

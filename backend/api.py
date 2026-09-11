@@ -35,7 +35,9 @@ Test with:
 """
 
 import os
+import io
 
+from PIL import Image, ImageOps
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -61,7 +63,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+from history_routes import router as history_router
+app.include_router(history_router)
 UPLOAD_DIR = "input_product/api_uploads"
 OCR_OUTPUT_DIR = "ocr_text"
 
@@ -96,13 +99,15 @@ def _build_nutrition_response(text_or_product, from_text: bool):
         }
 
 
-def _save_upload(file: UploadFile, contents: bytes) -> str:
+def _save_upload(filename: str, contents: bytes) -> str:
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    image_path = os.path.join(UPLOAD_DIR, file.filename)
+
+    image_path = os.path.join(UPLOAD_DIR, filename)
+
     with open(image_path, "wb") as f:
         f.write(contents)
-    return image_path
 
+    return image_path
 
 async def _validate_and_save_image(file: UploadFile) -> str:
     if not file.filename.lower().endswith((".png", ".jpg", ".jpeg")):
@@ -110,15 +115,62 @@ async def _validate_and_save_image(file: UploadFile) -> str:
             status_code=400,
             detail="Only .png, .jpg, or .jpeg product label images are supported.",
         )
+
     contents = await file.read()
+
     if len(contents) < 1024:
         raise HTTPException(
             status_code=400,
-            detail=f"The uploaded image appears incomplete or empty ({len(contents)} bytes). "
-                    f"Please try uploading it again.",
+            detail=(
+                f"The uploaded image appears incomplete or empty "
+                f"({len(contents)} bytes). Please try uploading it again."
+            ),
         )
-    return _save_upload(file, contents)
 
+    # ---------------------------------------------------------
+    # Decode and normalize the uploaded image.
+    # This protects OCR and Groq Vision from malformed JPEGs.
+    # ---------------------------------------------------------
+    try:
+        image = Image.open(io.BytesIO(contents))
+
+        # Force Pillow to fully decode the uploaded image.
+        image.load()
+
+        # Respect phone-camera EXIF rotation.
+        image = ImageOps.exif_transpose(image)
+
+        # Convert PNG/JPEG/etc. into standard RGB JPEG.
+        image = image.convert("RGB")
+
+        output_buffer = io.BytesIO()
+
+        image.save(
+            output_buffer,
+            format="JPEG",
+            quality=95,
+            optimize=True,
+        )
+
+        clean_contents = output_buffer.getvalue()
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not decode the uploaded image: {e}",
+        )
+
+    # Save normalized image as a new JPEG.
+    base_name = os.path.splitext(
+        os.path.basename(file.filename)
+    )[0]
+
+    clean_filename = f"{base_name}_clean.jpg"
+
+    return _save_upload(
+        clean_filename,
+        clean_contents,
+    )
 
 @app.post("/scan-product")
 async def scan_product(file: UploadFile = File(...)):

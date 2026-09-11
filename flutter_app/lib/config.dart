@@ -5,5 +5,5 @@
 //     (use the "inet" address from `ifconfig`, NOT the "broadcast" address)
 //   - iOS simulator              -> http://localhost:8000
 class AppConfig {
-  static const String baseUrl = 'http://10.154.55.8:8000';
+  static const String baseUrl = 'http://172.19.210.8:8000';
 }

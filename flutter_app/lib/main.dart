@@ -20,6 +20,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
+import 'package:legal_metrology_scanner_app/history_page.dart';
 
 void main() {
   runApp(const ComplianceScannerApp());
@@ -47,7 +48,7 @@ class ScannerHomePage extends StatefulWidget {
 
 class _ScannerHomePageState extends State<ScannerHomePage> {
   // ---- UPDATE THIS to match your backend's address ----
-  static const String baseUrl = 'http://10.154.55.131:8000';
+  static const String baseUrl = 'http://172.19.210.8:8000';
 
   final ImagePicker _picker = ImagePicker();
 
@@ -78,6 +79,38 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
         ),
       ),
     );
+  }
+
+  Future<void> _saveToHistory() async {
+    if (_result == null) return;
+    try {
+      final uri = Uri.parse('$baseUrl/save-scan');
+      final res = await http.post(
+        uri,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'product': _result!['product'],
+          'report': _result!['report'],
+          'nutrition_analysis': _result!['nutrition_analysis'],
+          'scan_method': _scanMethod,
+        }),
+      );
+      if (res.statusCode == 200 && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Saved to history')),
+        );
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Save failed (${res.statusCode})')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not reach backend: $e')),
+        );
+      }
+    }
   }
 
   Future<void> _showOtherScanOptions() async {
@@ -212,7 +245,23 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Legal Metrology Scanner')),
+      appBar: AppBar(
+        title: const Text('Legal Metrology Scanner'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'Scan History',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const HistoryPage(),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -508,6 +557,12 @@ class _ScannerHomePageState extends State<ScannerHomePage> {
               ),
             );
           }),
+        const SizedBox(height: 16),
+        ElevatedButton.icon(
+          icon: const Icon(Icons.save),
+          label: const Text('Save to History'),
+          onPressed: _saveToHistory,
+        ),
       ],
     );
   }

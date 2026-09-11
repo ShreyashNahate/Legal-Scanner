@@ -33,7 +33,7 @@ import csv
 import cv2
 import numpy as np
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageOps
 
 # ---- CONFIG ----
 PRODUCT_IMAGE_PATH = "input_product/sample_product_label.png"
@@ -97,50 +97,143 @@ def ocr_product_image(image_path: str, output_dir: str, lang: str = "eng"):
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
-    # ---- Try BOTH the raw image and a preprocessed version, then ----
-    # ---- automatically keep whichever scores higher. A fixed ----
-    # ---- preprocessing pipeline helps messy real-world photos but can
-    # ---- actually HURT already-clean images (confirmed by testing) -
-    # ---- so we don't gamble on one approach, we measure both.
-    raw_image = Image.open(image_path)
+    # ---------------------------------------------------------
+    # Load and fully decode the image with Pillow.
+    # ---------------------------------------------------------
+    try:
+        source_image = Image.open(image_path)
+        source_image.load()
+
+        # Respect phone-camera EXIF orientation.
+        source_image = ImageOps.exif_transpose(source_image)
+
+        # Convert to RGB.
+        source_image = source_image.convert("RGB")
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not load image for OCR: {e}"
+        )
+
+    # ---------------------------------------------------------
+    # IMPORTANT:
+    # Save a temporary PNG instead of passing a PIL image
+    # directly to pytesseract.
+    #
+    # This avoids pytesseract creating a temporary JPEG
+    # which was causing Leptonica JPEG errors.
+    # ---------------------------------------------------------
+    temp_png_path = os.path.join(
+        output_dir,
+        f".{base_name}_ocr_input.png"
+    )
+
+    source_image.save(
+        temp_png_path,
+        format="PNG"
+    )
+
+    # Create preprocessed version.
     preprocessed_image = preprocess_for_ocr(image_path)
 
-    candidates = {"raw": raw_image, "preprocessed": preprocessed_image}
+    temp_preprocessed_png_path = os.path.join(
+        output_dir,
+        f".{base_name}_ocr_preprocessed.png"
+    )
+
+    preprocessed_image.save(
+        temp_preprocessed_png_path,
+        format="PNG"
+    )
+
+    # ---------------------------------------------------------
+    # Run OCR directly on PNG FILE PATHS.
+    # Do not pass PIL images to pytesseract.
+    # ---------------------------------------------------------
+    candidates = {
+        "raw": temp_png_path,
+        "preprocessed": temp_preprocessed_png_path,
+    }
+
     scores = {}
     layout_by_candidate = {}
 
-    for name, candidate_image in candidates.items():
+    for name, candidate_path in candidates.items():
+
         layout_data = pytesseract.image_to_data(
-            candidate_image, lang=lang, output_type=pytesseract.Output.DICT
+            candidate_path,
+            lang=lang,
+            output_type=pytesseract.Output.DICT,
         )
+
         scores[name] = _average_confidence(layout_data)
         layout_by_candidate[name] = layout_data
 
     best_name = max(scores, key=scores.get)
-    best_image = candidates[best_name]
+    best_image_path = candidates[best_name]
     best_layout_data = layout_by_candidate[best_name]
 
-    print(f"OCR confidence — raw: {scores['raw']:.1f}/100, "
-          f"preprocessed: {scores['preprocessed']:.1f}/100 "
-          f"-> using '{best_name}'")
+    print(
+        f"OCR confidence — raw: {scores['raw']:.1f}/100, "
+        f"preprocessed: {scores['preprocessed']:.1f}/100 "
+        f"-> using '{best_name}'"
+    )
 
-    # ---- 1. Plain text extraction (from the winning version) ----
-    text = pytesseract.image_to_string(best_image, lang=lang)
-    text_path = os.path.join(output_dir, f"{base_name}.txt")
+    # ---------------------------------------------------------
+    # 1. Plain text extraction
+    # ---------------------------------------------------------
+    text = pytesseract.image_to_string(
+        best_image_path,
+        lang=lang,
+    )
+
+    text_path = os.path.join(
+        output_dir,
+        f"{base_name}.txt"
+    )
+
     with open(text_path, "w", encoding="utf-8") as f:
         f.write(text)
-    print(f"  Saved plain text -> {text_path}  ({len(text.strip())} characters)")
 
-    # ---- 2. Word-level bounding boxes + confidence (from the winning version) ----
-    layout_path = os.path.join(output_dir, f"{base_name}_layout.tsv")
+    print(
+        f"  Saved plain text -> {text_path} "
+        f"({len(text.strip())} characters)"
+    )
+
+    # ---------------------------------------------------------
+    # 2. Word-level bounding boxes + confidence
+    # ---------------------------------------------------------
+    layout_path = os.path.join(
+        output_dir,
+        f"{base_name}_layout.tsv"
+    )
+
     num_words_written = 0
-    with open(layout_path, "w", encoding="utf-8", newline="") as f:
+
+    with open(
+        layout_path,
+        "w",
+        encoding="utf-8",
+        newline=""
+    ) as f:
+
         writer = csv.writer(f, delimiter="\t")
-        writer.writerow(["word", "left", "top", "width", "height", "confidence"])
+
+        writer.writerow([
+            "word",
+            "left",
+            "top",
+            "width",
+            "height",
+            "confidence"
+        ])
 
         num_boxes = len(best_layout_data["text"])
+
         for i in range(num_boxes):
+
             word = best_layout_data["text"][i].strip()
+
             if word == "":
                 continue
 
@@ -152,22 +245,44 @@ def ocr_product_image(image_path: str, output_dir: str, lang: str = "eng"):
                 best_layout_data["height"][i],
                 best_layout_data["conf"][i],
             ])
+
             num_words_written += 1
 
-    print(f"  Saved layout data -> {layout_path}  ({num_words_written} word(s))")
+    print(
+        f"  Saved layout data -> {layout_path} "
+        f"({num_words_written} word(s))"
+    )
 
     avg_conf = scores[best_name]
+
     low_conf_count = sum(
-        1 for i in range(len(best_layout_data["conf"]))
-        if best_layout_data["text"][i].strip() != "" and 0 <= int(best_layout_data["conf"][i]) < 50
+        1
+        for i in range(len(best_layout_data["conf"]))
+        if (
+            best_layout_data["text"][i].strip() != ""
+            and 0 <= int(best_layout_data["conf"][i]) < 50
+        )
     )
-    print(f"\n  Average word confidence: {avg_conf:.1f}/100")
+
+    print(
+        f"\n  Average word confidence: "
+        f"{avg_conf:.1f}/100"
+    )
+
     if low_conf_count:
-        print(f"  NOTE: {low_conf_count} word(s) had confidence below 50. "
-              f"These may need manual review later rather than being trusted blindly.")
+        print(
+            f"  NOTE: {low_conf_count} word(s) had confidence "
+            f"below 50. These may need manual review later "
+            f"rather than being trusted blindly."
+        )
+
+    # ---------------------------------------------------------
+    # Remove temporary PNG files.
+    # ---------------------------------------------------------
+    try:
+        os.remove(temp_png_path)
+        os.remove(temp_preprocessed_png_path)
+    except OSError:
+        pass
 
     return text_path, layout_path
-
-
-if __name__ == "__main__":
-    ocr_product_image(PRODUCT_IMAGE_PATH, OUTPUT_DIR, OCR_LANG)

@@ -46,19 +46,38 @@ from groq import Groq
 # qwen/qwen3.6-27b: 27B multimodal model, supports JSON mode, free tier.
 # (qwen/qwen3.8-27b is a newer alternative with tunable reasoning effort,
 # but limited to 3 images/request vs 5 - either works for this use case.)
-MODEL_NAME = "qwen/qwen3.6-27b"
+MODEL_NAME = "qwen/qwen3.8-27b"
 
-LEGAL_FIELDS_PROMPT = """You are looking at a photo of a packaged product's label.
+LEGAL_FIELDS_PROMPT = """Look at the product label image.
 
-Extract ONLY the following fields, exactly as they appear on the label. Do not infer, guess, or invent any value. If a field is not visible, not legible, or not present on the label, leave it as an empty string "".
+Extract the following fields exactly as printed on the label.
+Do not guess or infer. If a field is not visible or readable, use an empty string.
 
-You are NOT deciding whether this product is compliant with any regulation. You are only transcribing what is literally printed on the label, like a careful data-entry clerk would.
+Return ONLY valid JSON. Do not use markdown or explanations.
 
-Be concise: return COMPACT JSON (no indentation/whitespace), no markdown fences, no explanation - JSON only. For "ingredients", if there are more than 15 items, include only the first 15 followed by "...".
+The JSON must contain exactly these keys:
 
-Respond in JSON format matching exactly this shape:
+{
+  "product_name": "",
+  "common_or_generic_name": "",
+  "manufacturer_name": "",
+  "manufacturer_address": "",
+  "packer_name": "",
+  "importer_name": "",
+  "country_of_origin": "",
+  "net_quantity": "",
+  "quantity_unit": "",
+  "mrp": "",
+  "manufacturing_date": "",
+  "expiry_date": "",
+  "best_before": "",
+  "batch_number": "",
+  "consumer_care_email": "",
+  "consumer_care_phone": "",
+  "ingredients": ""
+}
 
-{"product_name":"","common_or_generic_name":"","manufacturer_name":"","manufacturer_address":"","packer_name":"","importer_name":"","country_of_origin":"","net_quantity":"","quantity_unit":"","mrp":"","manufacturing_date":"","expiry_date":"","best_before":"","batch_number":"","consumer_care_email":"","consumer_care_phone":"","ingredients":""}"""
+For ingredients, copy only text that is actually visible on the label."""
 
 NUTRITION_CLAIMS_PROMPT = """You are looking at a photo of a packaged product's label - specifically its nutrition facts table and any marketing claims printed on it.
 
@@ -87,25 +106,26 @@ def _encode_image(image_path: str):
 
 def _call_vision_model(client, image_data: str, mime_type: str, prompt: str):
     completion = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{image_data}"
-                        },
+    model=MODEL_NAME,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{image_data}"
                     },
-                ],
-            }
-        ],
-        temperature=0.2,  # low temperature - we want faithful transcription, not creativity
-        max_completion_tokens=1000,  # Groq free tier hard cap
-        response_format={"type": "json_object"},  # Groq's built-in JSON mode
-    )
+                },
+            ],
+        }
+    ],
+    temperature=0.2,
+    max_completion_tokens=1000,
+    reasoning_effort="none",
+    response_format={"type": "json_object"},
+)
 
     raw_text = completion.choices[0].message.content.strip()
 

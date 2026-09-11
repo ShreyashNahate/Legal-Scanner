@@ -37,7 +37,7 @@ from groq import Groq
 
 # Fast general-purpose text model - no image decoding needed here, so
 # this can be lighter/faster than the vision model used in step8.
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = "qwen/qwen3.8-27b"
 
 LEGAL_FIELDS_TEMPLATE = """You are given raw OCR text extracted from a photo of a packaged product's label. OCR is imperfect - it may have misread some characters, dropped words, or broken lines oddly.
 

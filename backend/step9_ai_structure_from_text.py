@@ -460,9 +460,11 @@ Use EXACTLY this JSON structure:
   "quantity_unit": "",
   "mrp": "",
   "manufacturing_date": "",
+  "packing_date": "",
   "expiry_date": "",
   "best_before": "",
   "batch_number": "",
+  "fssai_license_numbers": [],
   "consumer_care_email": "",
   "consumer_care_phone": "",
   "ingredients": ""
@@ -597,25 +599,88 @@ LEGAL_SCHEMA = {
     "schema": {
         "type": "object",
         "additionalProperties": False,
+
         "properties": {
-            "product_name": {"type": "string"},
-            "common_or_generic_name": {"type": "string"},
-            "manufacturer_name": {"type": "string"},
-            "manufacturer_address": {"type": "string"},
-            "packer_name": {"type": "string"},
-            "importer_name": {"type": "string"},
-            "country_of_origin": {"type": "string"},
-            "net_quantity": {"type": "string"},
-            "quantity_unit": {"type": "string"},
-            "mrp": {"type": "string"},
-            "manufacturing_date": {"type": "string"},
-            "expiry_date": {"type": "string"},
-            "best_before": {"type": "string"},
-            "batch_number": {"type": "string"},
-            "consumer_care_email": {"type": "string"},
-            "consumer_care_phone": {"type": "string"},
-            "ingredients": {"type": "string"},
+            "product_name": {
+                "type": "string"
+            },
+
+            "common_or_generic_name": {
+                "type": "string"
+            },
+
+            "manufacturer_name": {
+                "type": "string"
+            },
+
+            "manufacturer_address": {
+                "type": "string"
+            },
+
+            "packer_name": {
+                "type": "string"
+            },
+
+            "importer_name": {
+                "type": "string"
+            },
+
+            "country_of_origin": {
+                "type": "string"
+            },
+
+            "net_quantity": {
+                "type": "string"
+            },
+
+            "quantity_unit": {
+                "type": "string"
+            },
+
+            "mrp": {
+                "type": "string"
+            },
+
+            "manufacturing_date": {
+                "type": "string"
+            },
+
+            "packing_date": {
+                "type": "string"
+            },
+
+            "expiry_date": {
+                "type": "string"
+            },
+
+            "best_before": {
+                "type": "string"
+            },
+
+            "batch_number": {
+                "type": "string"
+            },
+
+            "fssai_license_numbers": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                }
+            },
+
+            "consumer_care_email": {
+                "type": "string"
+            },
+
+            "consumer_care_phone": {
+                "type": "string"
+            },
+
+            "ingredients": {
+                "type": "string"
+            }
         },
+
         "required": [
             "product_name",
             "common_or_generic_name",
@@ -628,17 +693,17 @@ LEGAL_SCHEMA = {
             "quantity_unit",
             "mrp",
             "manufacturing_date",
+            "packing_date",
             "expiry_date",
             "best_before",
             "batch_number",
+            "fssai_license_numbers",
             "consumer_care_email",
             "consumer_care_phone",
-            "ingredients",
-        ],
-    },
+            "ingredients"
+        ]
+    }
 }
-
-
 NUTRITION_SCHEMA = {
     "name": "nutrition_and_claims",
     "strict": True,
@@ -744,7 +809,6 @@ NUTRITION_SCHEMA = {
         ]
     }
 }
-
 
 # ---------------------------------------------------------
 # MODEL CALL

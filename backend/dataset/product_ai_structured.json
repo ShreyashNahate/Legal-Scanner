@@ -1,0 +1,86 @@
+{
+  "batch_number": "23/05",
+  "best_before": "",
+  "common_or_generic_name": "Eggs",
+  "consumer_care_email": "yojanapoultrypune@gmail.com",
+  "consumer_care_phone": "9130098788",
+  "country_of_origin": "",
+  "expiry_date": "03/08/26",
+  "fssai_license_numbers": [
+    "11524996000376",
+    "1151403800070",
+    "11524996000396",
+    "11526035000203",
+    "11526035000202"
+  ],
+  "importer_name": "",
+  "ingredients": "",
+  "manufacturer_address": "401/402, Global Square, 4th Floor, Deccan College Road, Yerwada, Pune Municipal Corporation, Maharashtra - 411006",
+  "manufacturer_name": "Yojana Poultry Pvt. Ltd.",
+  "manufacturing_date": "",
+  "mrp": "150",
+  "net_quantity": "6",
+  "packer_name": "Yojana Poultry Pvt. Ltd.",
+  "packing_date": "",
+  "product_name": "Nutrient-enriched Eggs",
+  "quantity_unit": "pcs",
+  "claims": [
+    "Nutrient-enriched Eggs",
+    "In-house Feed",
+    "Infertile Eggs",
+    "Contributes to the normal function of the immune system",
+    "Contributes to the normal thyroid function",
+    "Contributes to the protection of the cells from oxidative stress",
+    "DIRECTLY FROM OUR FARMS TO YOUR PAN",
+    "HANDPACKED WITH LOVE & CARE"
+  ],
+  "nutrition": {
+    "added_sugar_g": "0.00",
+    "calories": "78.84",
+    "carbohydrates_g": "0.73",
+    "fat_g": "11.96",
+    "other_nutrients": [
+      {
+        "name": "Saturated Fat",
+        "per_100g": "4.87",
+        "per_serving": "0.25",
+        "unit": "g"
+      },
+      {
+        "name": "Cholesterol",
+        "per_100g": "368.2",
+        "per_serving": "184.1",
+        "unit": "mg"
+      },
+      {
+        "name": "Vitamin A",
+        "per_100g": "195.00",
+        "per_serving": "97.50",
+        "unit": "mcg"
+      },
+      {
+        "name": "Iron",
+        "per_100g": "0.60",
+        "per_serving": "0.30",
+        "unit": "mg"
+      },
+      {
+        "name": "Phosphorous",
+        "per_100g": "289.37",
+        "per_serving": "119.69",
+        "unit": "mg"
+      },
+      {
+        "name": "Selenium",
+        "per_100g": "74.00",
+        "per_serving": "37.00",
+        "unit": "mcg"
+      }
+    ],
+    "protein_g": "11.78",
+    "serving_size": "pc 50 g",
+    "sodium_mg": "126.36",
+    "sugar_g": "<0.50"
+  },
+  "ocr_source": "ai_text_structuring:qwen/qwen3.8-27b"
+}

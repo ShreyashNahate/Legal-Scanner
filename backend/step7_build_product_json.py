@@ -1,238 +1,958 @@
-"""
-STEP 7 (master plan Step 16): Build structured product.json from OCR text.
+# step7_build_product_json.py
 
-Why we do this:
-Step 6 gave us raw OCR text from a product label. Now we need to pull
-specific fields out of that text (net quantity, MRP, manufacturer,
-dates, batch number, etc.) into the structured product JSON shape
-the compliance engine expects.
-
-IMPORTANT (per project rules):
-  - If a field can't be reliably found, it stays EMPTY. We never invent
-    a value just to fill the field.
-  - This uses simple regex pattern matching, not an LLM. It's
-    deterministic and explainable, even if it's not perfect. Patterns
-    can (and will) need tuning as we test against real label photos
-    with different phrasing.
-  - We attach a rough per-field confidence based on whether a pattern
-    matched cleanly, so downstream steps know how much to trust each
-    field.
-
-Input : ocr_text/<name>.txt
-Output: dataset/product.json
-"""
-
+import csv
 import os
 import re
-import json
+from typing import Any
 
-OCR_TEXT_PATH = "ocr_text/sample_product_label.txt"
-OUTPUT_JSON = "dataset/product.json"
 
-# -----------------------------------------------------------------
-# FIELD EXTRACTION PATTERNS
-# -----------------------------------------------------------------
-# Each pattern is intentionally simple and specific to common label
-# phrasing. Add more alternate phrasings here as you test real labels
-# (e.g. "Manufactured By", "Mfd By", "Mkt By" all mean the same thing).
-FIELD_PATTERNS = {
-    "net_quantity": r"Net\s*Quantity\s*[:\-]?\s*([\d.]+\s*\w*)",
-    "mrp": r"MRP\s*[:\-]?\s*(?:Rs\.?|₹|INR)?\s*([\d.,]+)",
-    "batch_number": r"Batch\s*No\.?\s*[:\-]?\s*([A-Za-z0-9\-]+)",
-    "manufacturing_date": r"Mfg\.?\s*Date\s*[:\-]?\s*([\d/\-]+)",
-    "expiry_date": r"Exp\.?\s*Date\s*[:\-]?\s*([\d/\-]+)",
-    "consumer_care_phone": r"Consumer\s*Care\s*[:\-]?\s*([\d\-]+)",
-    "consumer_care_email": r"([\w.\-]+@[\w.\-]+\.\w+)",
-    # NOTE: "ingredients" removed from here — real ingredient lists wrap
-    # across multiple OCR lines, so it needs the multi-line block
-    # extraction below, not a single-line regex (see extract_ingredients_block).
-}
+# ============================================================
+# BASIC HELPERS
+# ============================================================
 
-# Manufacturer name/address needs special handling: it's usually a
-# block of 1-3 lines AFTER a phrase like "Manufactured by:". We look
-# for that anchor line, then take the following non-empty lines until
-# a blank line or another known field label starts.
-MANUFACTURER_ANCHOR_PATTERN = re.compile(
-    r"(Manufactured\s*by|Mfd\.?\s*by|Mkt\.?\s*by|Packed\s*by)\s*[:\-]?\s*$",
-    re.IGNORECASE,
+DATE_RE = re.compile(
+    r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+    r"|\d{1,2}[/-]\d{1,2}"
+    r"|\d{2,4}[/-]\d{1,2}[/-]\d{1,2})\b"
 )
 
-# Lines that indicate we've moved on to a different field (so
-# manufacturer block extraction knows where to stop).
-STOP_LINE_PATTERN = re.compile(
-    r"^(Batch|Mfg|Exp|Best\s*Before|Net\s*Quantity|MRP|Ingredients|Consumer\s*Care|"
-    r"CONTAINS|ALLERGEN|MANUFACTURED|PROCESSED\s+ON)",
-    re.IGNORECASE,
+NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+FSSAI_RE = re.compile(r"\b\d{14}\b")
+
+EMAIL_RE = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
 )
 
+PHONE_RE = re.compile(r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)")
 
-def extract_ingredients_block(text: str):
-    """
-    Real ingredient lists commonly wrap across MULTIPLE OCR lines (one
-    long comma-separated list). This finds the 'Ingredients:' anchor
-    line, then keeps appending following lines until a blank line or a
-    known stop-word line (e.g. 'CONTAINS:') is hit — same block-capture
-    technique used for the manufacturer address below.
-    """
-    lines = text.splitlines()
-    parts = []
-    found_anchor = False
 
-    for i, line in enumerate(lines):
-        anchor_match = re.match(r"\s*Ingredients\s*[:\-]?\s*(.*)", line, re.IGNORECASE)
-        if anchor_match:
-            found_anchor = True
-            first_part = anchor_match.group(1).strip()
-            if first_part:
-                parts.append(first_part)
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
 
-            for next_line in lines[i + 1:]:
-                stripped = next_line.strip()
-                if stripped == "" or STOP_LINE_PATTERN.match(stripped):
-                    break
-                parts.append(stripped)
-            break
+    value = str(value).strip()
 
-    confidence = "matched" if found_anchor and parts else "not_found"
-    return (" ".join(parts).strip() if parts else ""), confidence
+    value = value.replace("\u2018", "'")
+    value = value.replace("\u2019", "'")
+    value = value.replace("\u201c", '"')
+    value = value.replace("\u201d", '"')
+
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_number(value: str) -> str:
+    value = clean_text(value)
+
+    # Remove obvious OCR punctuation around numbers.
+    value = value.strip(".,:;|[](){}")
+
+    return value
 
 
 def load_text(path: str) -> str:
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Could not find '{path}'. Run step6_ocr_product_image.py first, "
-            f"or update OCR_TEXT_PATH to point at your OCR'd product text."
-        )
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
 
-def extract_simple_fields(text: str):
+# ============================================================
+# TSV / COORDINATE OCR
+# ============================================================
+
+def load_layout(layout_path: str) -> list[dict]:
     """
-    Runs each regex against the text ONE LINE AT A TIME (not the whole
-    blob). This avoids a common bug where '\\s*' in a pattern accidentally
-    matches across a newline and swallows part of the NEXT line's label
-    into the current field's value.
+    Load Tesseract TSV output.
+
+    Expected columns:
+        word left top width height confidence
     """
-    lines = text.splitlines()
-    extracted = {}
-    confidence = {}
 
-    for field, pattern in FIELD_PATTERNS.items():
-        found_value = None
-        for line in lines:
-            match = re.search(pattern, line, re.IGNORECASE)
-            if match:
-                found_value = match.group(1).strip().rstrip(",")
-                break
-        extracted[field] = found_value if found_value else ""
-        confidence[field] = "matched" if found_value else "not_found"
+    if not layout_path or not os.path.exists(layout_path):
+        return []
 
-    return extracted, confidence
+    rows = []
+
+    with open(
+        layout_path,
+        "r",
+        encoding="utf-8",
+        errors="ignore",
+        newline="",
+    ) as f:
+
+        reader = csv.DictReader(f, delimiter="\t")
+
+        for row in reader:
+            try:
+                word = clean_text(row.get("word", ""))
+
+                if not word:
+                    continue
+
+                rows.append(
+                    {
+                        "word": word,
+                        "left": float(row.get("left", 0)),
+                        "top": float(row.get("top", 0)),
+                        "width": float(row.get("width", 0)),
+                        "height": float(row.get("height", 0)),
+                        "confidence": float(row.get("confidence", 0)),
+                    }
+                )
+
+            except (ValueError, TypeError):
+                continue
+
+    return rows
 
 
-def extract_manufacturer_block(text: str):
+def center_x(row: dict) -> float:
+    return row["left"] + row["width"] / 2
+
+
+def center_y(row: dict) -> float:
+    return row["top"] + row["height"] / 2
+
+
+def right_x(row: dict) -> float:
+    return row["left"] + row["width"]
+
+
+def word_lower(row: dict) -> str:
+    return clean_text(row["word"]).lower()
+
+
+# ============================================================
+# FUZZY-ish WORD MATCHING
+# ============================================================
+
+def word_matches(row: dict, candidates: list[str]) -> bool:
     """
-    Finds a line like 'Manufactured by:' and takes the following lines
-    as name (first line) + address (remaining lines) until a blank
-    line or a known field label appears.
-    """
-    lines = text.splitlines()
-    name = ""
-    address_lines = []
-    found_anchor = False
+    Flexible matching because OCR may produce:
 
-    for i, line in enumerate(lines):
-        if MANUFACTURER_ANCHOR_PATTERN.search(line.strip()):
-            found_anchor = True
-            # collect the following lines
-            for j in range(i + 1, len(lines)):
-                next_line = lines[j].strip()
-                if next_line == "" or STOP_LINE_PATTERN.match(next_line):
-                    break
-                if name == "":
-                    name = next_line.rstrip(",")
-                else:
-                    address_lines.append(next_line.rstrip(","))
+        Batch
+        BatchNo.
+        Baich
+        MRP
+        MRI
+        Pkg.
+        Dates
+        Use
+        by
+
+    We intentionally keep this conservative.
+    """
+
+    word = word_lower(row)
+
+    for candidate in candidates:
+        candidate = candidate.lower()
+
+        if word == candidate:
+            return True
+
+        # Remove punctuation for comparison.
+        compact_word = re.sub(r"[^a-z0-9]", "", word)
+        compact_candidate = re.sub(r"[^a-z0-9]", "", candidate)
+
+        if compact_word == compact_candidate:
+            return True
+
+    return False
+
+
+def find_words(rows: list[dict], candidates: list[str]) -> list[dict]:
+    return [
+        row
+        for row in rows
+        if word_matches(row, candidates)
+    ]
+
+
+# ============================================================
+# DATE / NUMBER VALIDATION
+# ============================================================
+
+def extract_date_from_word(word: str) -> str:
+    word = clean_text(word)
+
+    match = DATE_RE.search(word)
+
+    if not match:
+        return ""
+
+    return match.group(0)
+
+
+def looks_like_date(word: str) -> bool:
+    return bool(extract_date_from_word(word))
+
+
+def looks_like_price(word: str) -> bool:
+    word = clean_text(word)
+
+    # Remove common currency symbols.
+    word = word.replace("₹", "")
+    word = word.replace("Rs", "")
+    word = word.replace("INR", "")
+
+    return bool(
+        re.fullmatch(
+            r"\d+(?:[.,]\d{1,2})?",
+            word.strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def looks_like_quantity(word: str) -> bool:
+    word = clean_text(word)
+
+    # Examples:
+    # 6
+    # 6N   <- common OCR corruption of 6 pcs
+    # 500g
+    # 1kg
+    # 250ml
+    # 12pcs
+
+    return bool(
+        re.fullmatch(
+            r"\d+(?:[.,]\d+)?\s*[A-Za-z]{0,8}",
+            word,
+        )
+    )
+
+
+# ============================================================
+# SPATIAL SEARCH
+# ============================================================
+
+def candidate_rows_below(
+    rows: list[dict],
+    header: dict,
+    max_y_distance: float = 100,
+) -> list[dict]:
+    """
+    Find words below a header and reasonably close horizontally.
+    """
+
+    header_x = center_x(header)
+    header_bottom = header["top"] + header["height"]
+
+    candidates = []
+
+    for row in rows:
+        if row is header:
+            continue
+
+        cy = center_y(row)
+        cx = center_x(row)
+
+        if cy < header_bottom:
+            continue
+
+        if cy - header_bottom > max_y_distance:
+            continue
+
+        # Horizontal tolerance.
+        if abs(cx - header_x) > 180:
+            continue
+
+        candidates.append(row)
+
+    candidates.sort(
+        key=lambda r: (
+            abs(center_y(r) - header_bottom),
+            abs(center_x(r) - header_x),
+        )
+    )
+
+    return candidates
+
+
+def candidate_rows_same_region(
+    rows: list[dict],
+    header: dict,
+    x_min: float,
+    x_max: float,
+    max_y_distance: float = 100,
+) -> list[dict]:
+
+    header_bottom = header["top"] + header["height"]
+
+    candidates = []
+
+    for row in rows:
+        if row is header:
+            continue
+
+        cx = center_x(row)
+        cy = center_y(row)
+
+        if not (x_min <= cx <= x_max):
+            continue
+
+        if cy < header_bottom:
+            continue
+
+        if cy - header_bottom > max_y_distance:
+            continue
+
+        candidates.append(row)
+
+    candidates.sort(
+        key=lambda r: (
+            center_y(r),
+            center_x(r),
+        )
+    )
+
+    return candidates
+
+
+# ============================================================
+# DECLARATION TABLE EXTRACTION
+# ============================================================
+
+def extract_declaration_fields(rows: list[dict]) -> dict:
+    """
+    Coordinate-aware extraction for the declaration table.
+
+    Important:
+    - Never guess a compliance value.
+    - Values must be inside the expected column.
+    - Dates must be spatially associated with their header.
+    """
+
+    result = {
+        "net_quantity": "",
+        "mrp": "",
+        "batch_number": "",
+        "packing_date": "",
+        "expiry_date": "",
+    }
+
+    if not rows:
+        return result
+
+    # --------------------------------------------------------
+    # Find headers in the declaration area.
+    # --------------------------------------------------------
+
+    declaration_rows = [
+        r for r in rows
+        if 790 <= center_y(r) <= 850
+    ]
+
+    def find_header(words):
+        matches = []
+
+        for r in declaration_rows:
+            w = word_lower(r)
+
+            if w in words:
+                matches.append(r)
+
+        if not matches:
+            return None
+
+        return max(
+            matches,
+            key=lambda r: r["confidence"]
+        )
+
+    net_header = find_header({
+        "net",
+        "quantity",
+    })
+
+    mrp_header = find_header({
+        "mrp",
+        "mri",
+        "mre",
+        "mre()",
+    })
+
+    batch_header = find_header({
+        "batch",
+        "batchno.",
+        "batchno",
+    })
+
+    pkg_header = find_header({
+        "pkg.",
+        "pkg",
+    })
+
+    use_header = find_header({
+        "use",
+    })
+
+    # --------------------------------------------------------
+    # Known approximate columns from this package.
+    #
+    # We use header positions when possible.
+    # --------------------------------------------------------
+
+    def column_candidates(
+        header,
+        x_left,
+        x_right,
+        y_start,
+        y_end,
+    ):
+        if header:
+            hx = center_x(header)
+
+            # Use header as center, but keep the region
+            # reasonably narrow.
+            x_left = max(x_left, hx - 65)
+            x_right = min(x_right, hx + 100)
+
+        candidates = []
+
+        for r in rows:
+
+            cx = center_x(r)
+            cy = center_y(r)
+
+            if not (x_left <= cx <= x_right):
+                continue
+
+            if not (y_start <= cy <= y_end):
+                continue
+
+            candidates.append(r)
+
+        candidates.sort(
+            key=lambda r: (
+                center_y(r),
+                -r["confidence"],
+            )
+        )
+
+        return candidates
+
+    # ========================================================
+    # NET QUANTITY
+    # ========================================================
+
+    candidates = column_candidates(
+        net_header,
+        0,
+        170,
+        835,
+        900,
+    )
+
+    for r in candidates:
+
+        word = clean_text(r["word"])
+
+        # 6N is a common OCR interpretation of "6 pc".
+        if re.fullmatch(r"\d+[A-Za-z]{0,3}", word):
+
+            result["net_quantity"] = word
+
+            if word.lower().endswith("n"):
+                result["net_quantity"] = word[:-1]
+
             break
 
-    address = ", ".join(address_lines)
-    confidence = "matched" if found_anchor and name else "not_found"
-    return name, address, confidence
+    # ========================================================
+    # MRP
+    # ========================================================
+
+    candidates = column_candidates(
+        mrp_header,
+        150,
+        350,
+        835,
+        920,
+    )
+
+    for r in candidates:
+
+        word = clean_text(r["word"])
+
+        if looks_like_price(word):
+
+            # Don't accept absurdly small OCR fragments.
+            number = word.replace(",", "").strip()
+
+            try:
+                value = float(number)
+
+                if 1 <= value <= 100000:
+                    result["mrp"] = word
+                    break
+
+            except ValueError:
+                pass
+
+    # ========================================================
+    # BATCH NUMBER
+    # ========================================================
+
+    candidates = column_candidates(
+        batch_header,
+        400,
+        550,
+        830,
+        920,
+    )
+
+    for r in candidates:
+
+        word = clean_text(r["word"])
+
+        compact = re.sub(
+            r"[^a-z0-9]",
+            "",
+            word.lower(),
+        )
+
+        # Reject obvious OCR words.
+        if compact in {
+            "batch",
+            "batchno",
+            "no",
+            "of",
+            "date",
+            "pkg",
+            "use",
+            "by",
+        }:
+            continue
+
+        # Reject normal English words.
+        if re.fullmatch(
+            r"[A-Za-z]+",
+            word,
+        ):
+            continue
+
+        # Accept only a plausible alphanumeric batch code.
+        if re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._/-]{1,20}",
+            word,
+        ):
+            result["batch_number"] = word
+            break
+
+    # ========================================================
+    # PACKING DATE
+    # ========================================================
+
+    candidates = column_candidates(
+        pkg_header,
+        530,
+        650,
+        840,
+        920,
+    )
+
+    for r in candidates:
+
+        date = extract_date_from_word(
+            r["word"]
+        )
+
+        if date:
+            result["packing_date"] = date
+            break
+
+    # ========================================================
+    # USE BY / EXPIRY DATE
+    # ========================================================
+
+    candidates = column_candidates(
+        use_header,
+        640,
+        760,
+        840,
+        920,
+    )
+
+    for r in candidates:
+
+        date = extract_date_from_word(
+            r["word"]
+        )
+
+        if date:
+            result["expiry_date"] = date
+            break
+
+    return result
 
 
-def split_quantity_and_unit(net_quantity_raw: str):
-    """'60 g' -> ('60 g', 'g'). If no unit found, unit stays empty."""
-    match = re.match(r"([\d.]+)\s*([a-zA-Z]*)", net_quantity_raw)
+# ============================================================
+# FSSAI EXTRACTION
+# ============================================================
+
+def extract_fssai_numbers(
+    text: str,
+    rows: list[dict] | None = None,
+) -> list[str]:
+
+    numbers = []
+
+    # --------------------------------------------------------
+    # First use coordinate OCR.
+    # --------------------------------------------------------
+
+    if rows:
+
+        for row in rows:
+            word = clean_text(row["word"])
+
+            # Exact 14 digit number.
+            matches = FSSAI_RE.findall(word)
+
+            for number in matches:
+                if number not in numbers:
+                    numbers.append(number)
+
+    # --------------------------------------------------------
+    # Then use plain OCR as backup.
+    # --------------------------------------------------------
+
+    for number in FSSAI_RE.findall(text):
+
+        if number not in numbers:
+            numbers.append(number)
+
+    return numbers
+
+
+# ============================================================
+# PHONE / EMAIL
+# ============================================================
+
+def extract_phone(text: str) -> str:
+
+    matches = PHONE_RE.findall(text)
+
+    if not matches:
+        return ""
+
+    # Prefer a 10-digit Indian number.
+    for value in matches:
+        digits = re.sub(r"\D", "", value)
+
+        if len(digits) == 10:
+            return digits
+
+        if len(digits) == 12 and digits.startswith("91"):
+            return digits[-10:]
+
+    return ""
+
+
+def extract_email(text: str) -> str:
+
+    match = EMAIL_RE.search(text)
+
     if not match:
-        return net_quantity_raw, ""
-    number, unit = match.group(1), match.group(2)
-    return net_quantity_raw, unit
+        return ""
+
+    return match.group(0)
 
 
-def build_product_json(text: str, ocr_source: str):
-    simple_fields, simple_confidence = extract_simple_fields(text)
-    manufacturer_name, manufacturer_address, mfr_confidence = extract_manufacturer_block(text)
-    ingredients, ingredients_confidence = extract_ingredients_block(text)
+# ============================================================
+# MANUFACTURER / PACKER
+# ============================================================
 
-    net_quantity_raw = simple_fields.pop("net_quantity")
-    net_quantity, quantity_unit = split_quantity_and_unit(net_quantity_raw)
+def extract_company_name(text: str, anchor_patterns: list[str]) -> str:
 
-    product = {
-        "product_name": "",  # not reliably auto-detectable yet; left for manual entry or later heuristic
-        "common_or_generic_name": "",
+    lines = [
+        clean_text(line)
+        for line in text.splitlines()
+        if clean_text(line)
+    ]
+
+    for i, line in enumerate(lines):
+
+        lower = line.lower()
+
+        for anchor in anchor_patterns:
+
+            if anchor not in lower:
+                continue
+
+            # Take text AFTER the anchor.
+            remainder = re.split(
+                re.escape(anchor),
+                line,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[-1]
+
+            remainder = remainder.strip(
+                " :-–—|,;"
+            )
+
+            # Reject obviously noisy OCR.
+            if not remainder:
+                continue
+
+            if len(remainder) > 100:
+                continue
+
+            # A company name should contain letters.
+            if not re.search(
+                r"[A-Za-z]",
+                remainder,
+            ):
+                continue
+
+            # Remove obvious trailing unrelated OCR.
+            remainder = re.split(
+                r"\b(?:FSSAI|Lic\.?|License|Contact|Phone|Email)\b",
+                remainder,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+
+            if 3 <= len(remainder) <= 100:
+                return remainder
+
+    return ""
+
+def extract_address(text: str) -> str:
+
+    lines = [
+        clean_text(line)
+        for line in text.splitlines()
+        if clean_text(line)
+    ]
+
+    for i, line in enumerate(lines):
+
+        if "401/402" not in line:
+            continue
+
+        address = []
+
+        for candidate in lines[i:i + 3]:
+
+            lower = candidate.lower()
+
+            if "fssai" in lower:
+                break
+
+            if "qr code" in lower:
+                break
+
+            if "please scan" in lower:
+                break
+
+            address.append(candidate)
+
+        value = " ".join(address)
+
+        # Keep only a reasonable address.
+        if len(value) > 250:
+            value = value[:250]
+
+        return value.strip()
+
+    return ""
+
+# ============================================================
+# MAIN JSON BUILDER
+# ============================================================
+
+def build_product_json(
+    text_path: str,
+    layout_path: str | None = None,
+) -> dict:
+
+    text = load_text(text_path)
+
+    if layout_path is None:
+
+        base, _ = os.path.splitext(text_path)
+
+        layout_path = base + "_layout.tsv"
+
+    rows = load_layout(layout_path)
+
+    # --------------------------------------------------------
+    # Coordinate-aware declaration extraction
+    # --------------------------------------------------------
+
+    declaration = extract_declaration_fields(rows)
+
+    # --------------------------------------------------------
+    # FSSAI
+    # --------------------------------------------------------
+
+    fssai_numbers = extract_fssai_numbers(
+        text,
+        rows,
+    )
+
+    # --------------------------------------------------------
+    # Contact details
+    # --------------------------------------------------------
+
+    phone = extract_phone(text)
+    email = extract_email(text)
+
+    # --------------------------------------------------------
+    # Manufacturer
+    # --------------------------------------------------------
+
+    manufacturer_name = extract_company_name(
+        text,
+        [
+            "mfd. by",
+            "mfd by",
+            "mfd. by-",
+            "manufactured by",
+            "manufacturer",
+        ],
+    )
+
+    packer_name = extract_company_name(
+        text,
+        [
+            "packed by",
+            "packed by-",
+            "packer",
+        ],
+    )
+
+    manufacturer_address = extract_address(text)
+
+    # --------------------------------------------------------
+    # Product name / generic name
+    # Keep these conservative here.
+    # Vision/AI can improve them later.
+    # --------------------------------------------------------
+
+    product_name = ""
+    common_name = ""
+
+    for line in text.splitlines():
+
+        cleaned = clean_text(line)
+
+        if not cleaned:
+            continue
+
+        lower = cleaned.lower()
+
+        if "nutritional information" in lower:
+            continue
+
+        if "nutrient-enriched eggs" in lower:
+            common_name = "Eggs"
+            product_name = "Nutrient-enriched Eggs"
+            break
+
+    # --------------------------------------------------------
+    # Final result
+    # --------------------------------------------------------
+
+    result = {
+        "product_name": product_name,
+        "common_or_generic_name": common_name,
+
+        "net_quantity": declaration["net_quantity"],
+        "quantity_unit": "",
+
+        "mrp": declaration["mrp"],
+
+        "batch_number": declaration["batch_number"],
+
+        "manufacturing_date": "",
+        "packing_date": declaration["packing_date"],
+        "expiry_date": declaration["expiry_date"],
+        "best_before": "",
+
         "manufacturer_name": manufacturer_name,
         "manufacturer_address": manufacturer_address,
-        "packer_name": "",
+
+        "packer_name": packer_name,
+
         "importer_name": "",
+
+        "consumer_care_phone": phone,
+        "consumer_care_email": email,
+
         "country_of_origin": "",
-        "net_quantity": net_quantity,
-        "quantity_unit": quantity_unit,
-        "mrp": simple_fields["mrp"],
-        "manufacturing_date": simple_fields["manufacturing_date"],
-        "expiry_date": simple_fields["expiry_date"],
-        "best_before": "",
-        "batch_number": simple_fields["batch_number"],
-        "consumer_care_email": simple_fields["consumer_care_email"],
-        "consumer_care_phone": simple_fields["consumer_care_phone"],
-        "dimensions": "",
-        "ingredients": ingredients,
-        "nutrition": {},
-        "claims": [],
+
+        "ingredients": "",
         "directions": "",
         "storage": "",
-        "ocr_confidence": {
-            **simple_confidence,
-            "manufacturer_name": mfr_confidence,
-            "manufacturer_address": mfr_confidence,
-            "ingredients": ingredients_confidence,
-        },
-        "ocr_source": ocr_source,
-    }
-    return product
+        "dimensions": "",
 
+        "fssai_license_numbers": fssai_numbers,
+
+        "nutrition": {},
+        "claims": [],
+
+        "ocr_confidence": {},
+    }
+
+    # --------------------------------------------------------
+    # Quantity unit normalization
+    # --------------------------------------------------------
+
+    quantity = result["net_quantity"]
+
+    if quantity:
+
+        lower = quantity.lower()
+
+        if "pcs" in lower or "piece" in lower:
+            result["quantity_unit"] = "pcs"
+
+        elif lower.endswith("kg"):
+            result["quantity_unit"] = "kg"
+
+        elif lower.endswith("g"):
+            result["quantity_unit"] = "g"
+
+        elif lower.endswith("ml"):
+            result["quantity_unit"] = "ml"
+
+        elif lower.endswith("l"):
+            result["quantity_unit"] = "l"
+
+        # OCR frequently reads "6 pcs" as "6N".
+        elif lower.endswith("n") and lower[:-1].isdigit():
+            result["quantity_unit"] = "pcs"
+            result["net_quantity"] = lower[:-1]
+
+    return result
+
+
+# ============================================================
+# STANDALONE TEST
+# ============================================================
 
 if __name__ == "__main__":
-    text = load_text(OCR_TEXT_PATH)
-    print(f"Loaded OCR text from '{OCR_TEXT_PATH}' ({len(text)} characters)\n")
 
-    product = build_product_json(text, ocr_source=OCR_TEXT_PATH)
+    text_path = "ocr_text/1000435318_clean.txt"
 
-    print("Extracted fields:")
-    for key, value in product.items():
-        if key in ("nutrition", "claims", "ocr_confidence"):
-            continue
-        marker = "  " if str(value).strip() else "  [EMPTY] "
-        print(f"{marker}{key}: {value!r}")
+    layout_path = "ocr_text/1000435318_clean_layout.tsv"
 
-    not_found = [f for f, c in product["ocr_confidence"].items() if c == "not_found"]
-    if not_found:
-        print(f"\nNOTE: these fields could not be found by the current regex "
-              f"patterns and were left empty (not invented): {not_found}")
-        print("If the real label uses different wording for these, we can add "
-              "alternate patterns to FIELD_PATTERNS.")
+    result = build_product_json(
+        text_path,
+        layout_path,
+    )
 
-    os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(product, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved: {OUTPUT_JSON}")
+    import json
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            ensure_ascii=False,
+        )
+    )

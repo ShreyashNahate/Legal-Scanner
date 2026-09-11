@@ -1,31 +1,17 @@
 """
-STEP 6 (master plan Steps 12-15): OCR a product label image.
+STEP 6 v4: Controlled multi-pass OCR for product label images.
 
-Why we do this:
-Unlike the PDF (one clean page per image), a product label photo is
-messier — different fonts, sizes, orientations, and multiple "sections"
-(front label, back label, nutrition table, etc.) in one image.
+Strategy:
+    - Original OCR = PRIMARY / trusted base
+    - Upscaled OCR = recovery source
+    - Targeted region OCR = recovery source
+    - Additional OCR is only allowed to add words that are
+      not already represented by the primary OCR.
+    - Avoids the huge duplication seen in v2/v3.
 
-We extract TWO things from OCR here, not just one:
-  1. Plain text (like Step 2 did for PDF pages) -> ocr_text/product1.txt
-  2. Word-level bounding boxes + confidence scores
-     -> ocr_text/product1_layout.tsv
-
-Why bounding boxes matter (per project plan):
-Later, to check things like "is this on the Principal Display Panel"
-or "is the font readable", we need to know WHERE text is on the image,
-not just WHAT the text says. We are not building that logic yet — this
-step only captures the raw coordinate + confidence data so it's
-available when we need it.
-
-We do NOT try to get perfect OCR here. Low-confidence words are kept
-in the layout file (with their confidence score) rather than silently
-dropped, so later steps can decide whether to trust them or mark
-something as REVIEW.
-
-Input : product image (jpg/png) — path set below
-Output: ocr_text/<name>.txt            (plain text)
-        ocr_text/<name>_layout.tsv     (word, bounding box, confidence)
+Outputs:
+    ocr_text/<name>.txt
+    ocr_text/<name>_layout.tsv
 """
 
 import os
@@ -35,156 +21,834 @@ import numpy as np
 import pytesseract
 from PIL import Image, ImageOps
 
-# ---- CONFIG ----
+
+# ---------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------
+
 PRODUCT_IMAGE_PATH = "input_product/sample_product_label.png"
 OUTPUT_DIR = "ocr_text"
-OCR_LANG = "eng"  # use "eng+hin" if the label has Hindi text too
+OCR_LANG = "eng"
+
+UPSCALE_FACTOR = 2
+
+# Regions overlap slightly.
+REGION_OVERLAP = 0.10
+
+# Maximum distance for considering two detections the same.
+DUPLICATE_DISTANCE = 12
+
+MIN_BOX_SIZE = 2
 
 
-def preprocess_for_ocr(image_path: str):
-    """
-    Improves OCR reliability on real-world photos (uneven lighting,
-    shadows, varied backgrounds, slight blur) by converting to
-    grayscale and applying adaptive thresholding, which is much more
-    robust than relying on the raw color photo alone.
+# ---------------------------------------------------------
+# IMAGE LOADING
+# ---------------------------------------------------------
 
-    Returns a PIL Image ready for pytesseract. Falls back to the
-    original image (rather than crashing) if OpenCV can't read the
-    file for any reason — we never want preprocessing to be a hard
-    dependency that blocks OCR entirely.
-    """
-    cv_image = cv2.imread(image_path)
-    if cv_image is None:
-        # OpenCV couldn't decode it - fall back to letting PIL/pytesseract
-        # try the raw file directly instead of failing outright.
-        return Image.open(image_path)
+def load_source_image(image_path: str) -> Image.Image:
 
-    gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-
-    # Denoise slightly before thresholding - helps with photo grain/noise
-    # from phone cameras in low light.
-    gray = cv2.medianBlur(gray, 3)
-
-    # Adaptive thresholding handles uneven lighting/backgrounds far
-    # better than a single global threshold would (e.g. a label
-    # photographed with a shadow across part of it).
-    thresholded = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
-        blockSize=35, C=11,
-    )
-
-    return Image.fromarray(thresholded)
-
-
-def _average_confidence(layout_data: dict) -> float:
-    """Computes average word confidence from pytesseract's image_to_data output."""
-    confidences = [
-        int(layout_data["conf"][i])
-        for i in range(len(layout_data["conf"]))
-        if layout_data["text"][i].strip() != "" and int(layout_data["conf"][i]) >= 0
-    ]
-    return sum(confidences) / len(confidences) if confidences else 0.0
-
-
-def ocr_product_image(image_path: str, output_dir: str, lang: str = "eng"):
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(
-            f"Could not find '{image_path}'. Put a product label image "
-            f"there, or update PRODUCT_IMAGE_PATH in this script."
-        )
-
-    os.makedirs(output_dir, exist_ok=True)
-    base_name = os.path.splitext(os.path.basename(image_path))[0]
-
-    # ---------------------------------------------------------
-    # Load and fully decode the image with Pillow.
-    # ---------------------------------------------------------
     try:
-        source_image = Image.open(image_path)
-        source_image.load()
+        image = Image.open(image_path)
+        image.load()
 
-        # Respect phone-camera EXIF orientation.
-        source_image = ImageOps.exif_transpose(source_image)
+        image = ImageOps.exif_transpose(image)
+        image = image.convert("RGB")
 
-        # Convert to RGB.
-        source_image = source_image.convert("RGB")
+        return image
 
     except Exception as e:
         raise RuntimeError(
             f"Could not load image for OCR: {e}"
         )
 
-    # ---------------------------------------------------------
-    # IMPORTANT:
-    # Save a temporary PNG instead of passing a PIL image
-    # directly to pytesseract.
-    #
-    # This avoids pytesseract creating a temporary JPEG
-    # which was causing Leptonica JPEG errors.
-    # ---------------------------------------------------------
-    temp_png_path = os.path.join(
-        output_dir,
-        f".{base_name}_ocr_input.png"
+
+# ---------------------------------------------------------
+# IMAGE PREPARATION
+# ---------------------------------------------------------
+
+def create_ocr_images(source_image: Image.Image):
+
+    rgb = np.array(source_image)
+
+    # Original image.
+    original = rgb
+
+    # 2x upscale.
+    upscaled = cv2.resize(
+        rgb,
+        None,
+        fx=UPSCALE_FACTOR,
+        fy=UPSCALE_FACTOR,
+        interpolation=cv2.INTER_CUBIC,
     )
 
-    source_image.save(
-        temp_png_path,
-        format="PNG"
+    # Contrast-enhanced grayscale.
+    gray = cv2.cvtColor(
+        upscaled,
+        cv2.COLOR_RGB2GRAY,
     )
 
-    # Create preprocessed version.
-    preprocessed_image = preprocess_for_ocr(image_path)
-
-    temp_preprocessed_png_path = os.path.join(
-        output_dir,
-        f".{base_name}_ocr_preprocessed.png"
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8),
     )
 
-    preprocessed_image.save(
-        temp_preprocessed_png_path,
-        format="PNG"
-    )
+    enhanced = clahe.apply(gray)
 
-    # ---------------------------------------------------------
-    # Run OCR directly on PNG FILE PATHS.
-    # Do not pass PIL images to pytesseract.
-    # ---------------------------------------------------------
-    candidates = {
-        "raw": temp_png_path,
-        "preprocessed": temp_preprocessed_png_path,
+    return {
+        "original": original,
+        "upscaled": upscaled,
+        "enhanced": enhanced,
     }
 
-    scores = {}
-    layout_by_candidate = {}
 
-    for name, candidate_path in candidates.items():
+# ---------------------------------------------------------
+# TESSERACT
+# ---------------------------------------------------------
 
-        layout_data = pytesseract.image_to_data(
-            candidate_path,
-            lang=lang,
-            output_type=pytesseract.Output.DICT,
+def safe_confidence(value):
+
+    try:
+        return float(value)
+
+    except Exception:
+        return -1.0
+
+
+def average_confidence(layout_data):
+
+    values = []
+
+    for i in range(
+        len(layout_data["text"])
+    ):
+
+        text = layout_data["text"][i].strip()
+
+        if not text:
+            continue
+
+        confidence = safe_confidence(
+            layout_data["conf"][i]
         )
 
-        scores[name] = _average_confidence(layout_data)
-        layout_by_candidate[name] = layout_data
+        if confidence >= 0:
+            values.append(confidence)
 
-    best_name = max(scores, key=scores.get)
-    best_image_path = candidates[best_name]
-    best_layout_data = layout_by_candidate[best_name]
+    if not values:
+        return 0.0
 
-    print(
-        f"OCR confidence — raw: {scores['raw']:.1f}/100, "
-        f"preprocessed: {scores['preprocessed']:.1f}/100 "
-        f"-> using '{best_name}'"
+    return sum(values) / len(values)
+
+
+def run_tesseract(
+    image,
+    lang="eng",
+    psm=6,
+):
+
+    return pytesseract.image_to_data(
+        image,
+        lang=lang,
+        config=f"--oem 3 --psm {psm}",
+        output_type=pytesseract.Output.DICT,
     )
 
-    # ---------------------------------------------------------
-    # 1. Plain text extraction
-    # ---------------------------------------------------------
-    text = pytesseract.image_to_string(
-        best_image_path,
+
+# ---------------------------------------------------------
+# REGIONS
+# ---------------------------------------------------------
+
+def generate_regions(width, height):
+
+    half_height = int(
+        height * 0.52
+    )
+
+    step = int(
+        half_height
+        * (1 - REGION_OVERLAP)
+    )
+
+    regions = []
+
+    # Always keep the entire image as primary.
+    regions.append(
+        (
+            "full",
+            0,
+            0,
+            width,
+            height,
+        )
+    )
+
+    y = 0
+    index = 0
+
+    while y < height:
+
+        y2 = min(
+            height,
+            y + half_height,
+        )
+
+        regions.append(
+            (
+                f"section_{index}",
+                0,
+                y,
+                width,
+                y2,
+            )
+        )
+
+        if y2 >= height:
+            break
+
+        y += step
+        index += 1
+
+    return regions
+
+
+# ---------------------------------------------------------
+# EXTRACT WORDS
+# ---------------------------------------------------------
+
+def extract_words(
+    layout_data,
+    offset_x,
+    offset_y,
+    scale,
+    source,
+    region,
+):
+
+    words = []
+
+    for i in range(
+        len(layout_data["text"])
+    ):
+
+        text = layout_data["text"][i].strip()
+
+        if not text:
+            continue
+
+        confidence = safe_confidence(
+            layout_data["conf"][i]
+        )
+
+        left = int(
+            layout_data["left"][i]
+        )
+
+        top = int(
+            layout_data["top"][i]
+        )
+
+        width = int(
+            layout_data["width"][i]
+        )
+
+        height = int(
+            layout_data["height"][i]
+        )
+
+        if (
+            width < MIN_BOX_SIZE
+            or height < MIN_BOX_SIZE
+        ):
+            continue
+
+        original_left = int(
+            offset_x
+            + left / scale
+        )
+
+        original_top = int(
+            offset_y
+            + top / scale
+        )
+
+        original_width = max(
+            1,
+            int(width / scale)
+        )
+
+        original_height = max(
+            1,
+            int(height / scale)
+        )
+
+        words.append(
+            {
+                "word": text,
+                "left": original_left,
+                "top": original_top,
+                "width": original_width,
+                "height": original_height,
+                "confidence": confidence,
+                "source": source,
+                "region": region,
+            }
+        )
+
+    return words
+
+
+# ---------------------------------------------------------
+# WORD NORMALIZATION
+# ---------------------------------------------------------
+
+def normalize_word(text):
+
+    text = text.lower().strip()
+
+    # Remove punctuation around a word.
+    text = text.strip(
+        ".,:;!?|[](){}<>\"'`"
+    )
+
+    return text
+
+
+# ---------------------------------------------------------
+# DUPLICATE CHECK
+# ---------------------------------------------------------
+
+def center(word):
+
+    return (
+        word["left"]
+        + word["width"] / 2,
+
+        word["top"]
+        + word["height"] / 2,
+    )
+
+
+def boxes_overlap(a, b):
+
+    ax1 = a["left"]
+    ay1 = a["top"]
+
+    ax2 = (
+        a["left"]
+        + a["width"]
+    )
+
+    ay2 = (
+        a["top"]
+        + a["height"]
+    )
+
+    bx1 = b["left"]
+    by1 = b["top"]
+
+    bx2 = (
+        b["left"]
+        + b["width"]
+    )
+
+    by2 = (
+        b["top"]
+        + b["height"]
+    )
+
+    return (
+        min(ax2, bx2)
+        > max(ax1, bx1)
+        and
+        min(ay2, by2)
+        > max(ay1, by1)
+    )
+
+
+def same_word(a, b):
+
+    wa = normalize_word(
+        a["word"]
+    )
+
+    wb = normalize_word(
+        b["word"]
+    )
+
+    if not wa or not wb:
+        return False
+
+    if wa != wb:
+        return False
+
+    ax, ay = center(a)
+    bx, by = center(b)
+
+    distance = (
+        (ax - bx) ** 2
+        +
+        (ay - by) ** 2
+    ) ** 0.5
+
+    if distance > DUPLICATE_DISTANCE:
+        return False
+
+    return boxes_overlap(
+        a,
+        b,
+    )
+
+
+# ---------------------------------------------------------
+# ADD PRIMARY WORDS
+# ---------------------------------------------------------
+
+def add_primary_words(
+    result,
+    words,
+):
+
+    for word in words:
+
+        result.append(word)
+
+
+# ---------------------------------------------------------
+# ADD RECOVERY WORDS
+# ---------------------------------------------------------
+
+def add_recovery_words(
+    result,
+    recovery_words,
+):
+
+    added = 0
+
+    for candidate in recovery_words:
+
+        duplicate = False
+
+        for existing in result:
+
+            if same_word(
+                candidate,
+                existing,
+            ):
+                duplicate = True
+                break
+
+        if duplicate:
+            continue
+
+        # -------------------------------------------------
+        # Important:
+        #
+        # We don't want low-confidence garbage from
+        # recovery OCR to overwhelm the primary OCR.
+        #
+        # Only accept reasonably confident recovery words.
+        # -------------------------------------------------
+
+        if (
+            candidate["confidence"] >= 45
+        ):
+
+            result.append(
+                candidate
+            )
+
+            added += 1
+
+    return added
+
+
+# ---------------------------------------------------------
+# TEXT RECONSTRUCTION
+# ---------------------------------------------------------
+
+def build_text(words):
+
+    if not words:
+        return ""
+
+    # Sort top-to-bottom first.
+    words = sorted(
+        words,
+        key=lambda x: (
+            x["top"],
+            x["left"],
+        )
+    )
+
+    lines = []
+
+    current = []
+    current_y = None
+
+    for word in words:
+
+        center_y = (
+            word["top"]
+            + word["height"] / 2
+        )
+
+        if current_y is None:
+
+            current = [word]
+            current_y = center_y
+
+            continue
+
+        tolerance = max(
+            8,
+            word["height"] * 0.65,
+        )
+
+        if abs(
+            center_y - current_y
+        ) <= tolerance:
+
+            current.append(word)
+
+            current_y = (
+                current_y
+                * (len(current) - 1)
+                + center_y
+            ) / len(current)
+
+        else:
+
+            current.sort(
+                key=lambda x: x["left"]
+            )
+
+            lines.append(
+                current
+            )
+
+            current = [word]
+            current_y = center_y
+
+    if current:
+
+        current.sort(
+            key=lambda x: x["left"]
+        )
+
+        lines.append(
+            current
+        )
+
+    output = []
+
+    for line in lines:
+
+        output.append(
+            " ".join(
+                word["word"]
+                for word in line
+            )
+        )
+
+    return "\n".join(
+        output
+    )
+
+
+# ---------------------------------------------------------
+# MAIN FUNCTION
+# ---------------------------------------------------------
+
+def ocr_product_image(
+    image_path: str,
+    output_dir: str,
+    lang: str = "eng",
+):
+
+    if not os.path.exists(
+        image_path
+    ):
+
+        raise FileNotFoundError(
+            f"Could not find "
+            f"'{image_path}'."
+        )
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
+
+    base_name = os.path.splitext(
+        os.path.basename(image_path)
+    )[0]
+
+    # -----------------------------------------------------
+    # LOAD
+    # -----------------------------------------------------
+
+    source_image = load_source_image(
+        image_path
+    )
+
+    original_width, original_height = (
+        source_image.size
+    )
+
+    print(
+        f"\nOCR image size: "
+        f"{original_width} x "
+        f"{original_height}"
+    )
+
+    # -----------------------------------------------------
+    # CREATE OCR IMAGES
+    # -----------------------------------------------------
+
+    images = create_ocr_images(
+        source_image
+    )
+
+    print(
+        "OCR images: "
+        + ", ".join(
+            images.keys()
+        )
+    )
+
+    # -----------------------------------------------------
+    # PRIMARY OCR
+    # -----------------------------------------------------
+
+    print(
+        "\n========== PRIMARY OCR =========="
+    )
+
+    primary_layout = run_tesseract(
+        images["original"],
         lang=lang,
+        psm=6,
+    )
+
+    primary_confidence = (
+        average_confidence(
+            primary_layout
+        )
+    )
+
+    primary_words = extract_words(
+        primary_layout,
+        0,
+        0,
+        1,
+        "primary",
+        "full",
+    )
+
+    print(
+        f"Primary confidence: "
+        f"{primary_confidence:.1f}/100"
+    )
+
+    print(
+        f"Primary words: "
+        f"{len(primary_words)}"
+    )
+
+    # -----------------------------------------------------
+    # FINAL WORD LIST STARTS WITH PRIMARY OCR.
+    # -----------------------------------------------------
+
+    final_words = []
+
+    add_primary_words(
+        final_words,
+        primary_words,
+    )
+
+    # -----------------------------------------------------
+    # RECOVERY OCR #1
+    # -----------------------------------------------------
+
+    print(
+        "\n========== UPSCALE RECOVERY =========="
+    )
+
+    upscaled_layout = run_tesseract(
+        images["upscaled"],
+        lang=lang,
+        psm=6,
+    )
+
+    upscaled_confidence = (
+        average_confidence(
+            upscaled_layout
+        )
+    )
+
+    upscaled_words = extract_words(
+        upscaled_layout,
+        0,
+        0,
+        UPSCALE_FACTOR,
+        "upscaled",
+        "full",
+    )
+
+    added = add_recovery_words(
+        final_words,
+        upscaled_words,
+    )
+
+    print(
+        f"Upscaled confidence: "
+        f"{upscaled_confidence:.1f}/100"
+    )
+
+    print(
+        f"Upscaled detections: "
+        f"{len(upscaled_words)}"
+    )
+
+    print(
+        f"New words recovered: "
+        f"{added}"
+    )
+
+    # -----------------------------------------------------
+    # RECOVERY OCR #2
+    #
+    # Enhanced image is only used on sections.
+    # -----------------------------------------------------
+
+    print(
+        "\n========== REGION RECOVERY =========="
+    )
+
+    regions = generate_regions(
+        original_width,
+        original_height,
+    )
+
+    enhanced = images["enhanced"]
+
+    total_region_words = 0
+    total_region_added = 0
+
+    for (
+        region_name,
+        x1,
+        y1,
+        x2,
+        y2,
+    ) in regions:
+
+        # Skip the "full" region because the original
+        # and upscaled full-image passes already covered it.
+        if region_name == "full":
+            continue
+
+        ux1 = int(
+            x1 * UPSCALE_FACTOR
+        )
+
+        uy1 = int(
+            y1 * UPSCALE_FACTOR
+        )
+
+        ux2 = int(
+            x2 * UPSCALE_FACTOR
+        )
+
+        uy2 = int(
+            y2 * UPSCALE_FACTOR
+        )
+
+        crop = enhanced[
+            uy1:uy2,
+            ux1:ux2
+        ]
+
+        if crop.size == 0:
+            continue
+
+        layout = run_tesseract(
+            crop,
+            lang=lang,
+            psm=6,
+        )
+
+        confidence = (
+            average_confidence(
+                layout
+            )
+        )
+
+        region_words = extract_words(
+            layout,
+            x1,
+            y1,
+            UPSCALE_FACTOR,
+            "enhanced",
+            region_name,
+        )
+
+        added = add_recovery_words(
+            final_words,
+            region_words,
+        )
+
+        total_region_words += (
+            len(region_words)
+        )
+
+        total_region_added += added
+
+        print(
+            f"{region_name}: "
+            f"{len(region_words)} detections, "
+            f"{confidence:.1f} confidence, "
+            f"{added} new"
+        )
+
+    # -----------------------------------------------------
+    # FINAL DEDUPLICATION
+    #
+    # This is mostly a safety net because recovery words
+    # were already checked before being added.
+    # -----------------------------------------------------
+
+    print(
+        "\n========== FINAL MERGE =========="
+    )
+
+    print(
+        f"Primary words: "
+        f"{len(primary_words)}"
+    )
+
+    print(
+        f"New from upscale: "
+        f"{added if 'added' in locals() else 0}"
+    )
+
+    print(
+        f"Region detections: "
+        f"{total_region_words}"
+    )
+
+    print(
+        f"Region words recovered: "
+        f"{total_region_added}"
+    )
+
+    # -----------------------------------------------------
+    # Build final text.
+    # -----------------------------------------------------
+
+    text = build_text(
+        final_words
     )
 
     text_path = os.path.join(
@@ -192,32 +856,34 @@ def ocr_product_image(image_path: str, output_dir: str, lang: str = "eng"):
         f"{base_name}.txt"
     )
 
-    with open(text_path, "w", encoding="utf-8") as f:
+    with open(
+        text_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
         f.write(text)
 
-    print(
-        f"  Saved plain text -> {text_path} "
-        f"({len(text.strip())} characters)"
-    )
+    # -----------------------------------------------------
+    # SAVE LAYOUT
+    # -----------------------------------------------------
 
-    # ---------------------------------------------------------
-    # 2. Word-level bounding boxes + confidence
-    # ---------------------------------------------------------
     layout_path = os.path.join(
         output_dir,
         f"{base_name}_layout.tsv"
     )
 
-    num_words_written = 0
-
     with open(
         layout_path,
         "w",
         encoding="utf-8",
-        newline=""
+        newline="",
     ) as f:
 
-        writer = csv.writer(f, delimiter="\t")
+        writer = csv.writer(
+            f,
+            delimiter="\t",
+        )
 
         writer.writerow([
             "word",
@@ -225,64 +891,90 @@ def ocr_product_image(image_path: str, output_dir: str, lang: str = "eng"):
             "top",
             "width",
             "height",
-            "confidence"
+            "confidence",
         ])
 
-        num_boxes = len(best_layout_data["text"])
-
-        for i in range(num_boxes):
-
-            word = best_layout_data["text"][i].strip()
-
-            if word == "":
-                continue
+        for word in sorted(
+            final_words,
+            key=lambda x: (
+                x["top"],
+                x["left"],
+            )
+        ):
 
             writer.writerow([
-                word,
-                best_layout_data["left"][i],
-                best_layout_data["top"][i],
-                best_layout_data["width"][i],
-                best_layout_data["height"][i],
-                best_layout_data["conf"][i],
+                word["word"],
+                word["left"],
+                word["top"],
+                word["width"],
+                word["height"],
+                f"{word['confidence']:.1f}",
             ])
 
-            num_words_written += 1
+    # -----------------------------------------------------
+    # STATISTICS
+    # -----------------------------------------------------
 
-    print(
-        f"  Saved layout data -> {layout_path} "
-        f"({num_words_written} word(s))"
+    confidences = [
+        word["confidence"]
+        for word in final_words
+        if word["confidence"] >= 0
+    ]
+
+    avg_confidence = (
+        sum(confidences)
+        / len(confidences)
+        if confidences
+        else 0.0
     )
 
-    avg_conf = scores[best_name]
-
-    low_conf_count = sum(
+    low_confidence = sum(
         1
-        for i in range(len(best_layout_data["conf"]))
+        for word in final_words
         if (
-            best_layout_data["text"][i].strip() != ""
-            and 0 <= int(best_layout_data["conf"][i]) < 50
+            0 <= word["confidence"] < 50
         )
+    )
+
+    # -----------------------------------------------------
+    # OUTPUT
+    # -----------------------------------------------------
+
+    print(
+        f"\nSaved plain text -> "
+        f"{text_path} "
+        f"({len(text.strip())} characters)"
     )
 
     print(
-        f"\n  Average word confidence: "
-        f"{avg_conf:.1f}/100"
+        f"Saved layout data -> "
+        f"{layout_path} "
+        f"({len(final_words)} words)"
     )
 
-    if low_conf_count:
-        print(
-            f"  NOTE: {low_conf_count} word(s) had confidence "
-            f"below 50. These may need manual review later "
-            f"rather than being trusted blindly."
-        )
+    print(
+        f"\nFinal average confidence: "
+        f"{avg_confidence:.1f}/100"
+    )
 
-    # ---------------------------------------------------------
-    # Remove temporary PNG files.
-    # ---------------------------------------------------------
-    try:
-        os.remove(temp_png_path)
-        os.remove(temp_preprocessed_png_path)
-    except OSError:
-        pass
+    print(
+        f"Low-confidence words (<50): "
+        f"{low_confidence}"
+    )
 
-    return text_path, layout_path
+    print(
+        "\n========== OCR PREVIEW =========="
+    )
+
+    print(
+        text[:5000]
+    )
+
+    print(
+        "=================================\n"
+    )
+
+    return (
+        text_path,
+        layout_path,
+    )

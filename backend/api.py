@@ -46,6 +46,7 @@ from step7_build_product_json import build_product_json, load_text
 from rule_engine import load_json, run_rule_engine, COMPLIANCE_RULES_PATH
 from nutrition_analysis import analyze_nutrition_and_claims
 from step11_hybrid_merge import merge_product_data
+from step9_ai_structure_from_text import structure_text_with_ai
 
 from step1_pdf_to_images import convert_pdf_to_images
 from step2_ocr_pages import ocr_all_pages
@@ -198,7 +199,7 @@ async def scan_product(file: UploadFile = File(...)):
         text = load_text(text_path)
 
         print(f"[scan] Extracting fields via regex...")
-        product = build_product_json(text, ocr_source=text_path)
+        product = build_product_json(text_path)
 
         print(f"[scan] Validating against Legal Metrology rules...")
         compliance_rules = load_json(COMPLIANCE_RULES_PATH)
@@ -308,88 +309,218 @@ async def scan_product_ai_vision(file: UploadFile = File(...)):
 @app.post("/scan-product-hybrid")
 async def scan_product_hybrid(file: UploadFile = File(...)):
     """
-    RECOMMENDED endpoint when you have a GROQ_API_KEY: combines BOTH
-    extraction methods instead of picking one.
+    HYBRID PRODUCT SCANNER
 
-        Image -> OCR (step6) -> regex extraction (step7)  --\
-               \-> AI vision extraction (step8)              --> MERGE (step11) -> rule_engine.py
-
-    For every field, the AI vision result is used if it found
-    something; otherwise the OCR+regex result fills the gap. This is
-    the best-of-both approach: AI handles messy/angled photos and
-    unusual phrasing better, while regex acts as a free, always-on
-    safety net for anything AI happens to miss (or if AI has a
-    transient failure - see the fallback behavior below).
-
-    If GROQ_API_KEY is not set, or the AI call fails for any reason,
-    this endpoint gracefully falls back to regex-only results instead
-    of failing outright - you always get SOME result.
+    Image
+      -> Step 6: OCR
+      -> Step 7: Regex extraction
+      -> Step 8: Vision AI
+      -> Step 9: OCR text AI structuring
+      -> Step 11: Smart merge
+      -> Rule Engine
     """
+
     image_path = await _validate_and_save_image(file)
 
     try:
+        # =====================================================
+        # STEP 6 — OCR
+        # =====================================================
         print(f"[hybrid] Running OCR on '{image_path}'...")
-        text_path, layout_path = ocr_product_image(image_path, OCR_OUTPUT_DIR)
+
+        text_path, layout_path = ocr_product_image(
+            image_path,
+            OCR_OUTPUT_DIR
+        )
+
         text = load_text(text_path)
 
-        print(f"[hybrid] Extracting fields via regex...")
-        product_regex = build_product_json(text, ocr_source=text_path)
+        print(
+            f"[hybrid] OCR complete. "
+            f"text={text_path}, layout={layout_path}"
+        )
 
+        # =====================================================
+        # STEP 7 — REGEX / DETERMINISTIC EXTRACTION
+        # =====================================================
+        print("[hybrid] Extracting fields via regex...")
+
+        product_regex = build_product_json(
+            text_path=text_path,
+            layout_path=layout_path,
+        )
+
+        # =====================================================
+        # STEP 8 — VISION AI
+        # =====================================================
         product_vision = None
+
         if os.environ.get("GROQ_API_KEY"):
             try:
-                from step8_vision_extract_product import extract_product_fields_with_vision
-                print(f"[hybrid] Sending image to Groq vision model...")
-                product_vision = extract_product_fields_with_vision(image_path)
-                print(f"[hybrid] Vision responded successfully.")
+                from step8_vision_extract_product import (
+                    extract_product_fields_with_vision
+                )
+
+                print(
+                    "[hybrid] Sending image to Groq vision model..."
+                )
+
+                product_vision = extract_product_fields_with_vision(
+                    image_path
+                )
+
+                print(
+                    "[hybrid] Vision responded successfully."
+                )
+
             except Exception as e:
-                print(f"[hybrid] Vision extraction failed, falling back to regex-only: {e}")
+                print(
+                    "[hybrid] Vision extraction failed. "
+                    f"Continuing without vision: {e}"
+                )
                 product_vision = None
+
         else:
-            print(f"[hybrid] GROQ_API_KEY not set - using regex-only (no AI).")
+            print(
+                "[hybrid] GROQ_API_KEY not set - "
+                "skipping AI vision."
+            )
 
-        if product_vision is not None:
-            print(f"[hybrid] Merging vision + regex results...")
-            product = merge_product_data(product_vision, product_regex)
-        else:
-            product = product_regex
+        # =====================================================
+        # STEP 9 — AI STRUCTURING OF OCR TEXT
+        # =====================================================
+        product_ai_text = None
 
-        print(f"[hybrid] Validating against Legal Metrology rules...")
-        compliance_rules = load_json(COMPLIANCE_RULES_PATH)
-        report = run_rule_engine(compliance_rules, product)
-        print(f"[hybrid] Result: {report['summary']}")
+        if os.environ.get("GROQ_API_KEY"):
+            try:
+                print(
+                    "[hybrid] Sending OCR text + layout "
+                    "to Groq text model..."
+                )
 
-        # Nutrition analysis: start from regex-based (does protein-claim
-        # cross-checking), then fill in any nutrition values vision found
-        # that regex missed, and add any additional claims vision found.
+                product_ai_text = structure_text_with_ai(
+                    text,
+                    api_key=os.environ.get("GROQ_API_KEY"),
+                    layout_path=layout_path,
+                )
+
+                print(
+                    "[hybrid] OCR text AI responded successfully."
+                )
+
+            except Exception as e:
+                print(
+                    "[hybrid] OCR text AI failed. "
+                    f"Continuing without it: {e}"
+                )
+                product_ai_text = None
+
+        # =====================================================
+        # STEP 11 — SMART HYBRID MERGE
+        # =====================================================
+        print("[hybrid] Merging extraction results...")
+
+        product = merge_product_data(
+            product_vision or {},
+            product_regex,
+            product_ai_text or {},
+        )
+
+        # =====================================================
+        # RULE ENGINE
+        # =====================================================
+        print(
+            "[hybrid] Validating against "
+            "Legal Metrology rules..."
+        )
+
+        compliance_rules = load_json(
+            COMPLIANCE_RULES_PATH
+        )
+
+        report = run_rule_engine(
+            compliance_rules,
+            product
+        )
+
+        print(
+            f"[hybrid] Result: {report['summary']}"
+        )
+
+        # =====================================================
+        # NUTRITION ANALYSIS
+        # =====================================================
         nutrition_result = analyze_nutrition_and_claims(text)
-        if product_vision is not None:
-            vision_nutrition = product_vision.get("nutrition", {}) or {}
-            for k, v in vision_nutrition.items():
-                if v and not nutrition_result["nutrition"].get(k):
-                    nutrition_result["nutrition"][k] = v
-            existing_claim_texts = {c["claim_text"].lower() for c in nutrition_result["claims"]}
-            for claim_text in product_vision.get("claims", []) or []:
-                if claim_text.lower() not in existing_claim_texts:
-                    nutrition_result["claims"].append({
-                        "claim_text": claim_text,
-                        "category": "unclassified",
-                        "status": "NEEDS_VERIFICATION",
-                        "evidence": "Detected by AI vision model; not cross-checked against nutrition values",
-                    })
-            nutrition_result["nutrition_fields_not_found"] = [
-                k for k, v in nutrition_result["nutrition"].items() if not v
-            ]
+
+        # Add merged nutrition values if available.
+        merged_nutrition = product.get(
+            "nutrition",
+            {}
+        ) or {}
+
+        for key, value in merged_nutrition.items():
+            if value:
+                nutrition_result["nutrition"][key] = value
+
+        # Add merged claims.
+        existing_claim_texts = {
+            c["claim_text"].strip().lower()
+            for c in nutrition_result["claims"]
+        }
+
+        for claim_text in product.get(
+            "claims",
+            []
+        ) or []:
+
+            clean_claim = str(
+                claim_text
+            ).strip()
+
+            if (
+                clean_claim
+                and clean_claim.lower()
+                not in existing_claim_texts
+            ):
+                nutrition_result["claims"].append({
+                    "claim_text": clean_claim,
+                    "category": "unclassified",
+                    "status": "NEEDS_VERIFICATION",
+                    "evidence": (
+                        "Detected during hybrid "
+                        "AI/OCR extraction."
+                    ),
+                })
+
+        nutrition_result[
+            "nutrition_fields_not_found"
+        ] = [
+            k
+            for k, v
+            in nutrition_result["nutrition"].items()
+            if not v
+        ]
 
     except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not process this image. Details: {e}",
+            detail=(
+                "Could not process this image. "
+                f"Details: {e}"
+            ),
         )
 
-    return {"product": product, "report": report, "nutrition_analysis": nutrition_result}
+    return {
+        "product": product,
+        "report": report,
+        "nutrition_analysis": nutrition_result,
+    }
 
 
 @app.post("/admin/upload-rules-pdf")
